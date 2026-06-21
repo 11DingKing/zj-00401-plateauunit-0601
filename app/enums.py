@@ -78,5 +78,39 @@ ISSUE_SEVERITY_LABELS = {
 }
 
 
+class Team(str, Enum):
+    """责任班组。"""
+
+    foundation_team = "foundation_team"          # 基础班
+    hoisting_team = "hoisting_team"        # 吊装班
+    commissioning_team = "commissioning_team"  # 调试班
+    electrical_team = "electrical_team"    # 电气班
+    maintenance_team = "maintenance_team"      # 运维班
+
+
+TEAM_LABELS = {
+    Team.foundation_team: "基础班",
+    Team.hoisting_team: "吊装班",
+    Team.commissioning_team: "调试班",
+    Team.electrical_team: "电气班",
+    Team.maintenance_team: "运维班",
+}
+
+
+class ReinspectionConclusion(str, Enum):
+    """复验结论。"""
+
+    not_inspected = "not_inspected"    # 未复验
+    passed = "passed"             # 复验通过
+    failed = "failed"             # 复验未通过
+
+
+REINSPECTION_LABELS = {
+    ReinspectionConclusion.not_inspected: "未复验",
+    ReinspectionConclusion.passed: "复验通过",
+    ReinspectionConclusion.failed: "复验未通过",
+}
+
+
 def stage_index(stage: GateStage) -> int:
     return GATE_ORDER.index(stage)

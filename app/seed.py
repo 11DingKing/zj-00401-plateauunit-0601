@@ -5,7 +5,16 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app.enums import ConfigType, GateStage, GateStatus, IssueSeverity, IssueStatus, stage_index
+from app.enums import (
+    ConfigType,
+    GateStage,
+    GateStatus,
+    IssueSeverity,
+    IssueStatus,
+    ReinspectionConclusion,
+    Team,
+    stage_index,
+)
 from app.models import Gate, Issue, SpecialConfig, Unit
 
 
@@ -107,8 +116,15 @@ def _build_unit(spec: dict, db: Session) -> Unit:
             description=issue_spec.get("description"),
             severity=issue_spec.get("severity", IssueSeverity.medium).value,
             status=issue_spec.get("status", IssueStatus.open).value,
+            team=issue_spec.get("team"),
+            due_date=issue_spec.get("due_date"),
+            reinspection_conclusion=issue_spec.get("reinspection_conclusion"),
+            reinspection_remark=issue_spec.get("reinspection_remark"),
+            reinspected_at=issue_spec.get("reinspected_at"),
+            reinspected_by=issue_spec.get("reinspected_by"),
             created_at=issue_spec.get("created_at", datetime(2026, 3, 1)),
             closed_at=issue_spec.get("closed_at"),
+            closed_by=issue_spec.get("closed_by"),
         ))
 
     return unit
@@ -163,8 +179,15 @@ def seed_if_empty(db: Session) -> None:
                     "description": "巡检发现部分端子螺栓力矩不足，已复紧复测",
                     "severity": IssueSeverity.medium,
                     "status": IssueStatus.closed,
+                    "team": Team.electrical_team.value,
+                    "due_date": D(2026, 3, 5),
+                    "reinspection_conclusion": ReinspectionConclusion.passed.value,
+                    "reinspection_remark": "端子力矩全部复测合格，满足并网要求",
+                    "reinspected_at": D(2026, 3, 5, 10, 30),
+                    "reinspected_by": "赵伟",
                     "created_at": D(2026, 3, 4),
                     "closed_at": D(2026, 3, 5),
+                    "closed_by": "赵伟",
                 },
             ],
         },
@@ -236,6 +259,8 @@ def seed_if_empty(db: Session) -> None:
                     "description": "满负荷下齿轮箱高速端振动速度达 9.8mm/s，超限，需复alignment并复测",
                     "severity": IssueSeverity.high,
                     "status": IssueStatus.open,
+                    "team": Team.commissioning_team.value,
+                    "due_date": D(2026, 4, 1),
                     "created_at": D(2026, 3, 22),
                 },
             ],
@@ -275,6 +300,8 @@ def seed_if_empty(db: Session) -> None:
                     "description": "履带吊站位区域坡度大，需增设碎石垫层与挡土墙后复吊",
                     "severity": IssueSeverity.high,
                     "status": IssueStatus.open,
+                    "team": Team.hoisting_team.value,
+                    "due_date": D(2026, 3, 28),
                     "created_at": D(2026, 3, 18),
                 },
             ],

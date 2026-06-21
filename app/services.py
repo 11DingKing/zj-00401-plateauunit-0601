@@ -14,15 +14,21 @@ from app.enums import (
     GATE_STAGE_LABELS,
     GATE_STATUS_LABELS,
     ISSUE_SEVERITY_LABELS,
+    REINSPECTION_LABELS,
+    TEAM_LABELS,
     GateStage,
     GateStatus,
     IssueSeverity,
     IssueStatus,
+    ReinspectionConclusion,
+    Team,
     stage_index,
 )
 from app.models import Gate, Issue, SpecialConfig, Unit
 from app.schemas import (
     GateStatusUpdate,
+    IssueAssign,
+    IssueClose,
     IssueCreate,
     SpecialConfigUpsert,
     UnitCreate,
@@ -79,8 +85,23 @@ def _hours_display(hours: Optional[float]) -> Optional[str]:
     return f"{round(rem, 1)}小时"
 
 
-def _issue_to_out(issue: Issue, unit_code: str) -> dict:
+def _is_overdue(issue: Issue, now: Optional[datetime] = None) -> bool:
+    """判断问题是否逾期：状态为 open 且 due_date < 当前时间。"""
+    if issue.status != IssueStatus.open.value:
+        return False
+    if issue.due_date is None:
+        return False
+    ref = now or datetime.utcnow()
+    return issue.due_date < ref
+
+
+def _issue_to_out(issue: Issue, unit_code: str, now: Optional[datetime] = None) -> dict:
     stage_label = GATE_STAGE_LABELS.get(GateStage(issue.stage)) if issue.stage else None
+    team_label = TEAM_LABELS.get(Team(issue.team)) if issue.team else None
+    rc_label = (
+        REINSPECTION_LABELS.get(ReinspectionConclusion(issue.reinspection_conclusion))
+        if issue.reinspection_conclusion else None
+    )
     return {
         "id": issue.id,
         "unit_id": issue.unit_id,
@@ -92,8 +113,18 @@ def _issue_to_out(issue: Issue, unit_code: str) -> dict:
         "severity": issue.severity,
         "severity_label": ISSUE_SEVERITY_LABELS.get(IssueSeverity(issue.severity), issue.severity),
         "status": issue.status,
+        "team": issue.team,
+        "team_label": team_label,
+        "due_date": issue.due_date,
+        "overdue": _is_overdue(issue, now),
+        "reinspection_conclusion": issue.reinspection_conclusion,
+        "reinspection_conclusion_label": rc_label,
+        "reinspection_remark": issue.reinspection_remark,
+        "reinspected_at": issue.reinspected_at,
+        "reinspected_by": issue.reinspected_by,
         "created_at": issue.created_at,
         "closed_at": issue.closed_at,
+        "closed_by": issue.closed_by,
     }
 
 
@@ -141,10 +172,24 @@ def _open_issue_count(unit: Unit) -> int:
     return sum(1 for i in unit.issues if i.status == IssueStatus.open.value)
 
 
+def _overdue_issue_count(unit: Unit, now: Optional[datetime] = None) -> int:
+    return sum(1 for i in unit.issues if _is_overdue(i, now))
+
+
+def _grid_blocked_by_overdue(unit: Unit, now: Optional[datetime] = None) -> bool:
+    """机组是否因逾期未关闭问题而被拦截进入并网确认关卡。"""
+    ref = now or datetime.utcnow()
+    for issue in unit.issues:
+        if _is_overdue(issue, ref):
+            return True
+    return False
+
+
 # ---------------- 机组 ----------------
 def list_units(db: Session) -> list[dict]:
     units = db.query(Unit).order_by(Unit.code).all()
     result = []
+    now = datetime.utcnow()
     for u in units:
         cur = _current_stage(u)
         result.append(
@@ -161,6 +206,8 @@ def list_units(db: Session) -> list[dict]:
                 "operational": _is_operational(u),
                 "enabled_config_types": _enabled_config_types(u),
                 "open_issue_count": _open_issue_count(u),
+                "overdue_issue_count": _overdue_issue_count(u, now),
+                "grid_blocked_by_overdue": _grid_blocked_by_overdue(u, now),
             }
         )
     return result
@@ -171,6 +218,7 @@ def get_unit_detail(db: Session, unit_id: int) -> dict:
     if unit is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="机组不存在")
     cur = _current_stage(unit)
+    now = datetime.utcnow()
     return {
         "id": unit.id,
         "code": unit.code,
@@ -189,10 +237,12 @@ def get_unit_detail(db: Session, unit_id: int) -> dict:
         "updated_at": unit.updated_at,
         "configs": [_config_to_out(c) for c in unit.configs],
         "gates": [_gate_to_out(g) for g in unit.gates],
-        "issues": [_issue_to_out(i, unit.code) for i in unit.issues],
+        "issues": [_issue_to_out(i, unit.code, now) for i in unit.issues],
         "current_stage": cur.value if cur else None,
         "current_stage_label": GATE_STAGE_LABELS[cur] if cur else "已投运",
         "operational": _is_operational(unit),
+        "overdue_issue_count": _overdue_issue_count(unit, now),
+        "grid_blocked_by_overdue": _grid_blocked_by_overdue(unit, now),
     }
 
 
@@ -334,7 +384,6 @@ def update_gate_status(
 
     ordered = sorted(unit.gates, key=lambda g: g.stage_index)
     idx = stage_index(stage)
-
     now = datetime.utcnow()
 
     if new_status == GateStatus.passed:
@@ -346,6 +395,15 @@ def update_gate_status(
                     status.HTTP_400_BAD_REQUEST,
                     detail=f"上一关「{GATE_STAGE_LABELS[GATE_ORDER[idx - 1]]}」尚未通过，"
                     f"不能进入「{GATE_STAGE_LABELS[stage]}」",
+                )
+        # 并网确认关卡：拦截逾期未关闭问题
+        if stage == GateStage.grid_connection:
+            if _grid_blocked_by_overdue(unit, now):
+                od_count = _overdue_issue_count(unit, now)
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    detail=f"该机组存在 {od_count} 项逾期未关闭问题，"
+                    f"需先整改关闭后方可进行并网确认。",
                 )
         if target.started_at is None:
             target.started_at = now
@@ -377,6 +435,18 @@ def update_gate_status(
                 severity=IssueSeverity(payload.issue_severity or "medium").value,
                 status=IssueStatus.open.value,
             )
+            # 支持同步分派班组与约定时限
+            if payload.issue_team:
+                try:
+                    Team(payload.issue_team)
+                except ValueError:
+                    raise HTTPException(
+                        status.HTTP_400_BAD_REQUEST,
+                        detail=f"非法的责任班组: {payload.issue_team}",
+                    )
+                issue.team = payload.issue_team
+            if payload.issue_due_date is not None:
+                issue.due_date = payload.issue_due_date
             db.add(issue)
 
     elif new_status == GateStatus.pending:
@@ -396,6 +466,7 @@ def update_gate_status(
         "stage_label": GATE_STAGE_LABELS[stage],
         "gates": [_gate_to_out(g) for g in unit.gates],
         "operational": _is_operational(unit),
+        "grid_blocked_by_overdue": _grid_blocked_by_overdue(unit, now),
     }
 
 
@@ -405,6 +476,8 @@ def list_issues(
     status_filter: Optional[str] = None,
     unit_id: Optional[int] = None,
     stage: Optional[str] = None,
+    team: Optional[str] = None,
+    overdue: Optional[bool] = None,
 ) -> list[dict]:
     q = db.query(Issue, Unit.code).join(Unit, Issue.unit_id == Unit.id)
     if status_filter:
@@ -413,8 +486,18 @@ def list_issues(
         q = q.filter(Issue.unit_id == unit_id)
     if stage:
         q = q.filter(Issue.stage == stage)
+    if team:
+        q = q.filter(Issue.team == team)
     q = q.order_by(Issue.created_at.desc())
-    return [_issue_to_out(i, code) for i, code in q.all()]
+    now = datetime.utcnow()
+    result = []
+    for issue, code in q.all():
+        issue_out = _issue_to_out(issue, code, now)
+        if overdue is not None:
+            if issue_out["overdue"] != overdue:
+                continue
+        result.append(issue_out)
+    return result
 
 
 def create_issue(db: Session, payload: IssueCreate) -> dict:
@@ -427,6 +510,11 @@ def create_issue(db: Session, payload: IssueCreate) -> dict:
         sev = IssueSeverity(payload.severity)
     except ValueError:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"非法的严重程度: {payload.severity}")
+    if payload.team:
+        try:
+            Team(payload.team)
+        except ValueError:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"非法的责任班组: {payload.team}")
     unit = db.get(Unit, payload.unit_id)
     if unit is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="机组不存在")
@@ -437,26 +525,72 @@ def create_issue(db: Session, payload: IssueCreate) -> dict:
         description=payload.description,
         severity=sev.value,
         status=IssueStatus.open.value,
+        team=payload.team,
+        due_date=payload.due_date,
     )
     db.add(issue)
     db.commit()
     db.refresh(issue)
-    return _issue_to_out(issue, unit.code)
+    now = datetime.utcnow()
+    return _issue_to_out(issue, unit.code, now)
 
 
-def close_issue(db: Session, issue_id: int, closed_by: Optional[str]) -> dict:
+def assign_issue(db: Session, issue_id: int, payload: IssueAssign) -> dict:
+    issue = db.get(Issue, issue_id)
+    if issue is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="问题不存在")
+    if issue.status == IssueStatus.closed.value:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="已关闭的问题不能再分派")
+    if payload.team:
+        try:
+            Team(payload.team)
+        except ValueError:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"非法的责任班组: {payload.team}")
+        issue.team = payload.team
+    if payload.due_date is not None:
+        issue.due_date = payload.due_date
+    db.commit()
+    db.refresh(issue)
+    unit = db.get(Unit, issue.unit_id)
+    now = datetime.utcnow()
+    return _issue_to_out(issue, unit.code if unit else "", now)
+
+
+def close_issue(
+    db: Session, issue_id: int, payload: IssueClose
+) -> dict:
     issue = db.get(Issue, issue_id)
     if issue is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="问题不存在")
     if issue.status == IssueStatus.closed.value:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="该问题已关闭")
+    # 复验结论校验
+    if payload.reinspection_conclusion:
+        try:
+            ReinspectionConclusion(payload.reinspection_conclusion)
+        except ValueError:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail=f"非法的复验结论: {payload.reinspection_conclusion}",
+            )
+        issue.reinspection_conclusion = payload.reinspection_conclusion
+        issue.reinspection_remark = payload.reinspection_remark
+        issue.reinspected_at = datetime.utcnow()
+        issue.reinspected_by = payload.reinspected_by
+        # 复验未通过的不允许关闭
+        if issue.reinspection_conclusion == ReinspectionConclusion.failed.value:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail="复验结论为「复验未通过」，不允许关闭该问题。请继续整改后再复验。",
+            )
     issue.status = IssueStatus.closed.value
     issue.closed_at = datetime.utcnow()
-    issue.closed_by = closed_by
+    issue.closed_by = payload.closed_by
     db.commit()
     db.refresh(issue)
     unit = db.get(Unit, issue.unit_id)
-    return _issue_to_out(issue, unit.code if unit else "")
+    now = datetime.utcnow()
+    return _issue_to_out(issue, unit.code if unit else "", now)
 
 
 # ---------------- 统计 ----------------
@@ -469,14 +603,19 @@ def compute_stats(db: Session) -> dict:
     durations = [d for d in (_commissioning_hours(u) for u in operational) if d is not None]
     avg_hours = round(sum(durations) / len(durations), 2) if durations else None
 
-    open_issues = (
-        db.query(Issue, Unit.code)
+    now = datetime.utcnow()
+
+    open_issues_rows = (
+        db.query(Issue, Unit.code, Unit.slope_position)
         .join(Unit, Issue.unit_id == Unit.id)
         .filter(Issue.status == IssueStatus.open.value)
         .order_by(Issue.created_at.desc())
         .all()
     )
-    open_issue_out = [_issue_to_out(i, code) for i, code in open_issues]
+    open_issue_out = []
+    for issue, code, _ in open_issues_rows:
+        open_issue_out.append(_issue_to_out(issue, code, now))
+    overdue_count = sum(1 for i in open_issue_out if i["overdue"])
 
     coverage = []
     for ct in ConfigType:
@@ -497,6 +636,115 @@ def compute_stats(db: Session) -> dict:
             }
         )
 
+    # --- 按专项配置拆分未关闭问题 ---
+    # 构建 unit_id -> enabled config_types 的映射
+    unit_configs_map: dict[int, list[str]] = {}
+    for cfg in db.query(SpecialConfig).filter(SpecialConfig.enabled.is_(True)).all():
+        unit_configs_map.setdefault(cfg.unit_id, []).append(cfg.config_type)
+
+    by_config: dict[str, dict] = {ct.value: [] for ct in ConfigType}
+    # 还增加 "无专项配置" 桶
+    no_config_issues: list = []
+
+    for issue, code, _ in open_issues_rows:
+        issue_out = _issue_to_out(issue, code, now)
+        cts = unit_configs_map.get(issue.unit_id, [])
+        if not cts:
+            no_config_issues.append(issue_out)
+        else:
+            for ct in cts:
+                by_config.setdefault(ct, []).append(issue_out)
+
+    unclosed_by_config: list[dict] = []
+    for ct in ConfigType:
+        issues = by_config.get(ct.value, [])
+        od = sum(1 for i in issues if i["overdue"])
+        unclosed_by_config.append(
+            {
+                "config_type": ct.value,
+                "config_type_label": CONFIG_TYPE_LABELS[ct],
+                "count": len(issues),
+                "overdue_count": od,
+                "issues": issues,
+            }
+        )
+    if no_config_issues:
+        od = sum(1 for i in no_config_issues if i["overdue"])
+        unclosed_by_config.append(
+            {
+                "config_type": "none",
+                "config_type_label": "无专项配置",
+                "count": len(no_config_issues),
+                "overdue_count": od,
+                "issues": no_config_issues,
+            }
+        )
+
+    # --- 按坡位拆分未关闭问题 ---
+    by_slope: dict[str, list] = {}
+    for issue, code, slope_position in open_issues_rows:
+        issue_out = _issue_to_out(issue, code, now)
+        key = slope_position or "未知坡位"
+        by_slope.setdefault(key, []).append(issue_out)
+    unclosed_by_slope = [
+        {
+            "slope_position": sp,
+            "count": len(items),
+            "overdue_count": sum(1 for i in items if i["overdue"]),
+            "issues": items,
+        }
+        for sp, items in sorted(by_slope.items())
+    ]
+
+    # --- 按责任班组拆分未关闭问题 ---
+    by_team: dict[Optional[str], list] = {}
+    for issue, code, _ in open_issues_rows:
+        issue_out = _issue_to_out(issue, code, now)
+        key = issue.team  # None 代表未分派
+        by_team.setdefault(key, []).append(issue_out)
+
+    unclosed_by_team: list[dict] = []
+    # 先按预设顺序输出各班组
+    for tm in Team:
+        issues = by_team.get(tm.value, [])
+        od = sum(1 for i in issues if i["overdue"])
+        unclosed_by_team.append(
+            {
+                "team": tm.value,
+                "team_label": TEAM_LABELS[tm],
+                "count": len(issues),
+                "overdue_count": od,
+                "issues": issues,
+            }
+        )
+    # 未分派
+    unassigned = by_team.get(None, [])
+    # 同时收集非标准班组值（以防万一）
+    other_keys = [k for k in by_team.keys() if k not in (tm.value for tm in Team) and k is not None]
+    if unassigned:
+        od = sum(1 for i in unassigned if i["overdue"])
+        unclosed_by_team.append(
+            {
+                "team": None,
+                "team_label": "未分派",
+                "count": len(unassigned),
+                "overdue_count": od,
+                "issues": unassigned,
+            }
+        )
+    for k in other_keys:
+        issues = by_team[k]
+        od = sum(1 for i in issues if i["overdue"])
+        unclosed_by_team.append(
+            {
+                "team": k,
+                "team_label": k,
+                "count": len(issues),
+                "overdue_count": od,
+                "issues": issues,
+            }
+        )
+
     return {
         "total_units": total,
         "operational_count": len(operational),
@@ -504,6 +752,10 @@ def compute_stats(db: Session) -> dict:
         "average_debug_hours": avg_hours,
         "average_debug_hours_display": _hours_display(avg_hours),
         "unclosed_issue_count": len(open_issue_out),
+        "overdue_unclosed_count": overdue_count,
         "unclosed_issues": open_issue_out,
         "config_coverage": coverage,
+        "unclosed_by_config": unclosed_by_config,
+        "unclosed_by_slope": unclosed_by_slope,
+        "unclosed_by_team": unclosed_by_team,
     }

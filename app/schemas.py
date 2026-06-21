@@ -81,8 +81,18 @@ class IssueOut(BaseModel):
     severity: str
     severity_label: str
     status: str
+    team: Optional[str] = None
+    team_label: Optional[str] = None
+    due_date: Optional[datetime] = None
+    overdue: Optional[bool] = None
+    reinspection_conclusion: Optional[str] = None
+    reinspection_conclusion_label: Optional[str] = None
+    reinspection_remark: Optional[str] = None
+    reinspected_at: Optional[datetime] = None
+    reinspected_by: Optional[str] = None
     created_at: datetime
     closed_at: Optional[datetime] = None
+    closed_by: Optional[str] = None
 
 
 class UnitSummary(BaseModel):
@@ -102,6 +112,8 @@ class UnitSummary(BaseModel):
     operational: bool
     enabled_config_types: list[str]
     open_issue_count: int
+    overdue_issue_count: int
+    grid_blocked_by_overdue: bool
 
 
 class UnitDetail(BaseModel):
@@ -128,6 +140,8 @@ class UnitDetail(BaseModel):
     current_stage: Optional[str] = None
     current_stage_label: Optional[str] = None
     operational: bool
+    overdue_issue_count: int
+    grid_blocked_by_overdue: bool
 
 
 # ---------------- 专项配置 ----------------
@@ -146,6 +160,8 @@ class GateStatusUpdate(BaseModel):
     issue_title: Optional[str] = Field(None, description="当 status=failed 时可同时登记一条问题")
     issue_description: Optional[str] = None
     issue_severity: Optional[str] = "medium"
+    issue_team: Optional[str] = None
+    issue_due_date: Optional[datetime] = None
 
 
 # ---------------- 问题 ----------------
@@ -155,10 +171,21 @@ class IssueCreate(BaseModel):
     title: str
     description: Optional[str] = None
     severity: str = "medium"
+    team: Optional[str] = None
+    due_date: Optional[datetime] = None
+
+
+class IssueAssign(BaseModel):
+    """分派责任班组、约定关闭时限。"""
+    team: Optional[str] = None
+    due_date: Optional[datetime] = None
 
 
 class IssueClose(BaseModel):
     closed_by: Optional[str] = None
+    reinspection_conclusion: Optional[str] = None
+    reinspection_remark: Optional[str] = None
+    reinspected_by: Optional[str] = None
 
 
 # ---------------- 统计 ----------------
@@ -171,6 +198,32 @@ class ConfigCoverageItem(BaseModel):
     coverage_pct: float      # 百分比
 
 
+class UnclosedByConfig(BaseModel):
+    """按专项配置拆的未关闭问题。"""
+    config_type: str
+    config_type_label: str
+    count: int
+    overdue_count: int
+    issues: list[IssueOut]
+
+
+class UnclosedBySlope(BaseModel):
+    """按坡位拆的未关闭问题。"""
+    slope_position: str
+    count: int
+    overdue_count: int
+    issues: list[IssueOut]
+
+
+class UnclosedByTeam(BaseModel):
+    """按责任班组拆的未关闭问题。"""
+    team: Optional[str]
+    team_label: Optional[str]
+    count: int
+    overdue_count: int
+    issues: list[IssueOut]
+
+
 class StatsOut(BaseModel):
     total_units: int
     operational_count: int
@@ -180,5 +233,9 @@ class StatsOut(BaseModel):
     )
     average_debug_hours_display: Optional[str] = None
     unclosed_issue_count: int
+    overdue_unclosed_count: int
     unclosed_issues: list[IssueOut]
     config_coverage: list[ConfigCoverageItem]
+    unclosed_by_config: list[UnclosedByConfig]
+    unclosed_by_slope: list[UnclosedBySlope]
+    unclosed_by_team: list[UnclosedByTeam]

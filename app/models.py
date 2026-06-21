@@ -103,6 +103,12 @@ class Issue(Base):
     description = Column(Text, nullable=True)           # 问题描述
     severity = Column(String, nullable=False, default="medium")  # IssueSeverity
     status = Column(String, nullable=False, default="open")      # IssueStatus
+    team = Column(String, nullable=True)               # 责任班组 Team
+    due_date = Column(DateTime, nullable=True)          # 约定关闭时限
+    reinspection_conclusion = Column(String, nullable=True)  # 复验结论 ReinspectionConclusion
+    reinspection_remark = Column(Text, nullable=True)    # 复验备注
+    reinspected_at = Column(DateTime, nullable=True)
+    reinspected_by = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     closed_at = Column(DateTime, nullable=True)
     closed_by = Column(String, nullable=True)
