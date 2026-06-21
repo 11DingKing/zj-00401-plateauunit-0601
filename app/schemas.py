@@ -270,3 +270,65 @@ class StatsOut(BaseModel):
     unclosed_by_config: list[UnclosedByConfig]
     unclosed_by_slope: list[UnclosedBySlope]
     unclosed_by_team: list[UnclosedByTeam]
+
+
+# ---------------- 坡位适配复盘 ----------------
+class SlopeConfigMetric(BaseModel):
+    """坡位×配置类型的指标数据。"""
+
+    config_type: str
+    config_type_label: str
+    unit_count: int = Field(..., description="该配置下的机组数")
+    operational_count: int = Field(..., description="已投运机组数")
+    acceptance_rate: float = Field(..., description="验收通过率（0~1）：已通过全部关卡的机组占比")
+    acceptance_rate_pct: float = Field(..., description="验收通过率百分比")
+    rework_count: int = Field(..., description="返工次数：该组所有机组的问题总数")
+    avg_rework_per_unit: float = Field(..., description="平均每台机组返工次数")
+    avg_debug_hours: Optional[float] = Field(
+        None, description="平均调试耗时(小时)，仅统计已投运机组"
+    )
+    avg_debug_hours_display: Optional[str] = None
+    stage_pass_rates: dict[str, float] = Field(
+        ..., description="各关卡通过率，key 为关卡 stage 值"
+    )
+
+
+class SlopeReviewItem(BaseModel):
+    """单坡位复盘数据。"""
+
+    slope_position: str
+    unit_count: int = Field(..., description="该坡位机组总数")
+    operational_count: int = Field(..., description="已投运机组数")
+    overall_acceptance_rate: float = Field(..., description="整体验收通过率")
+    overall_acceptance_rate_pct: float = Field(..., description="整体验收通过率百分比")
+    total_rework_count: int = Field(..., description="该坡位总返工次数")
+    avg_rework_per_unit: float = Field(..., description="平均每台机组返工次数")
+    overall_avg_debug_hours: Optional[float] = Field(
+        None, description="该坡位平均调试耗时(小时)"
+    )
+    overall_avg_debug_hours_display: Optional[str] = None
+    by_config: list[SlopeConfigMetric] = Field(
+        ..., description="按专项配置类型拆分的指标"
+    )
+    risk_score: float = Field(
+        ..., description="拖慢投运风险评分（0~100，越高越容易拖慢）"
+    )
+    risk_level: str = Field(..., description="风险等级：低/中/高")
+    unit_codes: list[str] = Field(..., description="该坡位机组编号列表")
+    unit_summaries: list[UnitSummary] = Field(..., description="机组摘要列表，可下钻查看详情")
+
+
+class SlopeReviewOut(BaseModel):
+    """坡位适配复盘完整输出。"""
+
+    total_units: int
+    slope_count: int = Field(..., description="涉及坡位数量")
+    slope_reviews: list[SlopeReviewItem] = Field(
+        ..., description="按风险评分降序排列的各坡位复盘数据"
+    )
+    config_type_legend: list[dict[str, str]] = Field(
+        ..., description="配置类型图例说明"
+    )
+    stage_legend: list[dict[str, object]] = Field(
+        ..., description="验收关卡图例说明"
+    )

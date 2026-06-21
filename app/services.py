@@ -846,3 +846,204 @@ def compute_stats(db: Session) -> dict:
         "unclosed_by_slope": unclosed_by_slope,
         "unclosed_by_team": unclosed_by_team,
     }
+
+
+# ---------------- 坡位适配复盘 ----------------
+def _unit_summary_for_review(unit: Unit, now: datetime) -> dict:
+    """生成复盘用的机组摘要，与 list_units 逻辑一致。"""
+    cur = _current_stage(unit)
+    return {
+        "id": unit.id,
+        "code": unit.code,
+        "name": unit.name,
+        "rated_capacity_mw": unit.rated_capacity_mw,
+        "altitude_m": unit.altitude_m,
+        "slope_position": unit.slope_position,
+        "grid_batch": unit.grid_batch,
+        "current_stage": cur.value if cur else None,
+        "current_stage_label": GATE_STAGE_LABELS[cur] if cur else "已投运",
+        "operational": _is_operational(unit),
+        "enabled_config_types": _enabled_config_types(unit),
+        "config_coverage_complete": _config_coverage_complete(unit),
+        "missing_config_types": _missing_config_types(unit),
+        "open_issue_count": _open_issue_count(unit),
+        "overdue_issue_count": _overdue_issue_count(unit, now),
+        "grid_blocked_by_overdue": _grid_blocked_by_overdue(unit, now),
+    }
+
+
+def _stage_pass_rate_for_units(units: list[Unit], stage: GateStage) -> float:
+    """计算一批机组在指定关卡的通过率。"""
+    total = len(units)
+    if total == 0:
+        return 0.0
+    passed = sum(
+        1 for u in units
+        if _gate_by_stage(u, stage) and _gate_by_stage(u, stage).status == GateStatus.passed.value
+    )
+    return round(passed / total, 4)
+
+
+def _compute_risk_score(
+    acceptance_rate: float,
+    avg_rework: float,
+    avg_debug_hours: Optional[float],
+    unit_count: int,
+) -> float:
+    """
+    计算拖慢投运风险评分（0~100）。
+    维度：验收通过率权重40%、返工次数权重30%、调试耗时权重30%。
+    通过率越低、返工越多、耗时越长 → 风险越高。
+    """
+    score = 0.0
+    score += (1 - acceptance_rate) * 40
+    rework_factor = min(avg_rework / 5.0, 1.0)
+    score += rework_factor * 30
+    if avg_debug_hours is not None:
+        hours_factor = min(avg_debug_hours / 720.0, 1.0)
+        score += hours_factor * 30
+    else:
+        score += 30
+    return round(score, 2)
+
+
+def _risk_level(score: float) -> str:
+    if score < 30:
+        return "低"
+    elif score < 60:
+        return "中"
+    else:
+        return "高"
+
+
+def _analyze_config_group(
+    config_type: Optional[str],
+    units: list[Unit],
+    now: datetime,
+) -> dict:
+    """分析某坡位下某配置类型的机组群指标。"""
+    unit_count = len(units)
+    if unit_count == 0:
+        return None
+
+    operational_units = [u for u in units if _is_operational(u)]
+    operational_count = len(operational_units)
+    acceptance_rate = round(operational_count / unit_count, 4) if unit_count else 0.0
+
+    rework_count = sum(len(u.issues) for u in units)
+    avg_rework = round(rework_count / unit_count, 2) if unit_count else 0.0
+
+    durations = [d for d in (_commissioning_hours(u) for u in operational_units) if d is not None]
+    avg_debug_hours = round(sum(durations) / len(durations), 2) if durations else None
+
+    stage_pass_rates = {}
+    for stage in GATE_ORDER:
+        stage_pass_rates[stage.value] = _stage_pass_rate_for_units(units, stage)
+
+    ct = ConfigType(config_type) if config_type else None
+    return {
+        "config_type": config_type if config_type else "none",
+        "config_type_label": CONFIG_TYPE_LABELS[ct] if ct else "无专项配置",
+        "unit_count": unit_count,
+        "operational_count": operational_count,
+        "acceptance_rate": acceptance_rate,
+        "acceptance_rate_pct": round(acceptance_rate * 100, 2),
+        "rework_count": rework_count,
+        "avg_rework_per_unit": avg_rework,
+        "avg_debug_hours": avg_debug_hours,
+        "avg_debug_hours_display": _hours_display(avg_debug_hours),
+        "stage_pass_rates": stage_pass_rates,
+    }
+
+
+def compute_slope_review(db: Session) -> dict:
+    """
+    坡位适配复盘：按坡位归组，对比各专项配置的验收通过率、返工次数、平均调试耗时。
+    串联机组档案、验收记录、专项配置，输出风险评分帮助判断哪类坡位最易拖慢投运。
+    """
+    now = datetime.utcnow()
+    units = db.query(Unit).order_by(Unit.code).all()
+    total_units = len(units)
+
+    units_by_slope: dict[str, list[Unit]] = {}
+    for u in units:
+        key = u.slope_position or "未知坡位"
+        units_by_slope.setdefault(key, []).append(u)
+
+    slope_reviews = []
+    for slope_position, slope_units in units_by_slope.items():
+        slope_unit_count = len(slope_units)
+        slope_operational = [u for u in slope_units if _is_operational(u)]
+        slope_operational_count = len(slope_operational)
+        slope_acceptance_rate = round(slope_operational_count / slope_unit_count, 4) if slope_unit_count else 0.0
+        slope_total_rework = sum(len(u.issues) for u in slope_units)
+        slope_avg_rework = round(slope_total_rework / slope_unit_count, 2) if slope_unit_count else 0.0
+
+        slope_durations = [d for d in (_commissioning_hours(u) for u in slope_operational) if d is not None]
+        slope_avg_debug = round(sum(slope_durations) / len(slope_durations), 2) if slope_durations else None
+
+        unit_config_map: dict[Optional[str], list[Unit]] = {}
+        for u in slope_units:
+            enabled_configs = _enabled_config_types(u)
+            if not enabled_configs:
+                unit_config_map.setdefault(None, []).append(u)
+            else:
+                for ct in enabled_configs:
+                    unit_config_map.setdefault(ct, []).append(u)
+
+        by_config = []
+        for ct in ConfigType:
+            group = unit_config_map.get(ct.value, [])
+            analysis = _analyze_config_group(ct.value, group, now)
+            if analysis:
+                by_config.append(analysis)
+
+        none_group = unit_config_map.get(None, [])
+        none_analysis = _analyze_config_group(None, none_group, now)
+        if none_analysis:
+            by_config.append(none_analysis)
+
+        risk_score = _compute_risk_score(
+            slope_acceptance_rate,
+            slope_avg_rework,
+            slope_avg_debug,
+            slope_unit_count,
+        )
+
+        slope_reviews.append({
+            "slope_position": slope_position,
+            "unit_count": slope_unit_count,
+            "operational_count": slope_operational_count,
+            "overall_acceptance_rate": slope_acceptance_rate,
+            "overall_acceptance_rate_pct": round(slope_acceptance_rate * 100, 2),
+            "total_rework_count": slope_total_rework,
+            "avg_rework_per_unit": slope_avg_rework,
+            "overall_avg_debug_hours": slope_avg_debug,
+            "overall_avg_debug_hours_display": _hours_display(slope_avg_debug),
+            "by_config": by_config,
+            "risk_score": risk_score,
+            "risk_level": _risk_level(risk_score),
+            "unit_codes": [u.code for u in slope_units],
+            "unit_summaries": [_unit_summary_for_review(u, now) for u in slope_units],
+        })
+
+    slope_reviews.sort(key=lambda x: x["risk_score"], reverse=True)
+
+    config_legend = [
+        {"value": ct.value, "label": CONFIG_TYPE_LABELS[ct]}
+        for ct in ConfigType
+    ]
+    config_legend.append({"value": "none", "label": "无专项配置"})
+
+    stage_legend = [
+        {"value": stage.value, "label": GATE_STAGE_LABELS[stage], "index": stage_index(stage)}
+        for stage in GATE_ORDER
+    ]
+
+    return {
+        "total_units": total_units,
+        "slope_count": len(units_by_slope),
+        "slope_reviews": slope_reviews,
+        "config_type_legend": config_legend,
+        "stage_legend": stage_legend,
+    }
