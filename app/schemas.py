@@ -111,6 +111,12 @@ class UnitSummary(BaseModel):
     current_stage_label: Optional[str] = None
     operational: bool
     enabled_config_types: list[str]
+    config_coverage_complete: bool = Field(
+        ..., description="专项配置是否已补齐（全部启用），与关卡流转同口径"
+    )
+    missing_config_types: list[str] = Field(
+        ..., description="尚未启用的专项配置类型列表"
+    )
     open_issue_count: int
     overdue_issue_count: int
     grid_blocked_by_overdue: bool
@@ -140,6 +146,12 @@ class UnitDetail(BaseModel):
     current_stage: Optional[str] = None
     current_stage_label: Optional[str] = None
     operational: bool
+    config_coverage_complete: bool = Field(
+        ..., description="专项配置是否已补齐（全部启用），与关卡流转同口径"
+    )
+    missing_config_types: list[str] = Field(
+        ..., description="尚未启用的专项配置类型列表"
+    )
     overdue_issue_count: int
     grid_blocked_by_overdue: bool
 
@@ -198,6 +210,16 @@ class ConfigCoverageItem(BaseModel):
     coverage_pct: float      # 百分比
 
 
+class ConfigIncompleteUnit(BaseModel):
+    """专项配置未补齐的机组（与关卡流转同口径）。"""
+
+    unit_id: int
+    code: str
+    name: str
+    missing_config_types: list[str]
+    current_stage: Optional[str] = None
+
+
 class UnclosedByConfig(BaseModel):
     """按专项配置拆的未关闭问题。"""
     config_type: str
@@ -236,6 +258,15 @@ class StatsOut(BaseModel):
     overdue_unclosed_count: int
     unclosed_issues: list[IssueOut]
     config_coverage: list[ConfigCoverageItem]
+    config_complete_count: int = Field(
+        ..., description="专项配置已补齐的机组数（与关卡流转同口径）"
+    )
+    config_incomplete_count: int = Field(
+        ..., description="专项配置未补齐的机组数"
+    )
+    config_incomplete_units: list[ConfigIncompleteUnit] = Field(
+        ..., description="专项配置未补齐的机组明细"
+    )
     unclosed_by_config: list[UnclosedByConfig]
     unclosed_by_slope: list[UnclosedBySlope]
     unclosed_by_team: list[UnclosedByTeam]

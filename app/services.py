@@ -185,6 +185,26 @@ def _grid_blocked_by_overdue(unit: Unit, now: Optional[datetime] = None) -> bool
     return False
 
 
+def _missing_config_types(unit: Unit) -> list[str]:
+    """机组尚未启用的专项配置类型（按枚举顺序），与统计覆盖率同口径。"""
+    enabled = {c.config_type for c in unit.configs if c.enabled}
+    return [ct.value for ct in ConfigType if ct.value not in enabled]
+
+
+def _config_coverage_complete(unit: Unit) -> bool:
+    """机组专项配置是否已补齐（全部启用）。"""
+    return not _missing_config_types(unit)
+
+
+def _open_issues_for_stage(unit: Unit, stage_value: str) -> list[Issue]:
+    """机组在指定关卡上仍未关闭的问题。"""
+    return [
+        i
+        for i in unit.issues
+        if i.status == IssueStatus.open.value and i.stage == stage_value
+    ]
+
+
 # ---------------- 机组 ----------------
 def list_units(db: Session) -> list[dict]:
     units = db.query(Unit).order_by(Unit.code).all()
@@ -205,6 +225,8 @@ def list_units(db: Session) -> list[dict]:
                 "current_stage_label": GATE_STAGE_LABELS[cur] if cur else "已投运",
                 "operational": _is_operational(u),
                 "enabled_config_types": _enabled_config_types(u),
+                "config_coverage_complete": _config_coverage_complete(u),
+                "missing_config_types": _missing_config_types(u),
                 "open_issue_count": _open_issue_count(u),
                 "overdue_issue_count": _overdue_issue_count(u, now),
                 "grid_blocked_by_overdue": _grid_blocked_by_overdue(u, now),
@@ -241,6 +263,8 @@ def get_unit_detail(db: Session, unit_id: int) -> dict:
         "current_stage": cur.value if cur else None,
         "current_stage_label": GATE_STAGE_LABELS[cur] if cur else "已投运",
         "operational": _is_operational(unit),
+        "config_coverage_complete": _config_coverage_complete(unit),
+        "missing_config_types": _missing_config_types(unit),
         "overdue_issue_count": _overdue_issue_count(unit, now),
         "grid_blocked_by_overdue": _grid_blocked_by_overdue(unit, now),
     }
@@ -396,6 +420,28 @@ def update_gate_status(
                     detail=f"上一关「{GATE_STAGE_LABELS[GATE_ORDER[idx - 1]]}」尚未通过，"
                     f"不能进入「{GATE_STAGE_LABELS[stage]}」",
                 )
+        # 问题清单联动：该关卡存在未关闭问题时不允许通过
+        open_stage_issues = _open_issues_for_stage(unit, stage.value)
+        if open_stage_issues:
+            titles = "、".join(f"「{i.title}」" for i in open_stage_issues[:5])
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail=f"该关卡存在 {len(open_stage_issues)} 项未关闭问题（{titles}），"
+                f"需先整改关闭并复验通过后方可通过「{GATE_STAGE_LABELS[stage]}」。",
+            )
+        # 专项配置覆盖率联动：进入带负荷试运行及之后阶段，必须补齐全部专项配置
+        if idx >= stage_index(GateStage.no_load_debug):
+            missing = _missing_config_types(unit)
+            if missing:
+                missing_labels = "、".join(
+                    CONFIG_TYPE_LABELS[ConfigType(m)] for m in missing
+                )
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    detail=f"专项配置未补齐（缺少 {missing_labels}），"
+                    f"不能通过「{GATE_STAGE_LABELS[stage]}」推进至后续阶段，"
+                    f"请先补齐专项配置。",
+                )
         # 并网确认关卡：拦截逾期未关闭问题
         if stage == GateStage.grid_connection:
             if _grid_blocked_by_overdue(unit, now):
@@ -466,6 +512,8 @@ def update_gate_status(
         "stage_label": GATE_STAGE_LABELS[stage],
         "gates": [_gate_to_out(g) for g in unit.gates],
         "operational": _is_operational(unit),
+        "config_coverage_complete": _config_coverage_complete(unit),
+        "missing_config_types": _missing_config_types(unit),
         "grid_blocked_by_overdue": _grid_blocked_by_overdue(unit, now),
     }
 
@@ -564,32 +612,52 @@ def close_issue(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="问题不存在")
     if issue.status == IssueStatus.closed.value:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="该问题已关闭")
+    now = datetime.utcnow()
+    # 需要复验通过方可关闭：高严重 / 关联验收关卡 / 曾复验未通过
+    requires_reinspection = (
+        issue.severity == IssueSeverity.high.value
+        or bool(issue.stage)
+        or issue.reinspection_conclusion == ReinspectionConclusion.failed.value
+    )
     # 复验结论校验
     if payload.reinspection_conclusion:
         try:
-            ReinspectionConclusion(payload.reinspection_conclusion)
+            rc = ReinspectionConclusion(payload.reinspection_conclusion)
         except ValueError:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
                 detail=f"非法的复验结论: {payload.reinspection_conclusion}",
             )
-        issue.reinspection_conclusion = payload.reinspection_conclusion
-        issue.reinspection_remark = payload.reinspection_remark
-        issue.reinspected_at = datetime.utcnow()
-        issue.reinspected_by = payload.reinspected_by
-        # 复验未通过的不允许关闭
-        if issue.reinspection_conclusion == ReinspectionConclusion.failed.value:
+        if rc == ReinspectionConclusion.not_inspected:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
-                detail="复验结论为「复验未通过」，不允许关闭该问题。请继续整改后再复验。",
+                detail="复验结论不能为「未复验」，请提供「复验通过」或「复验未通过」。",
             )
+        issue.reinspection_conclusion = rc.value
+        issue.reinspection_remark = payload.reinspection_remark
+        issue.reinspected_at = now
+        issue.reinspected_by = payload.reinspected_by
+        # 复验未通过：落库记录复验事件，问题保持开启，阻止带病关闭
+        if rc == ReinspectionConclusion.failed:
+            db.commit()
+            db.refresh(issue)
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail="复验结论为「复验未通过」，已记录复验事件，问题保持开启。"
+                "请继续整改后再次复验通过方可关闭。",
+            )
+        # rc == passed：允许关闭，继续执行关闭流程
+    elif requires_reinspection:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="该问题为高严重或关联验收关卡，需复验通过后方可关闭。",
+        )
     issue.status = IssueStatus.closed.value
-    issue.closed_at = datetime.utcnow()
+    issue.closed_at = now
     issue.closed_by = payload.closed_by
     db.commit()
     db.refresh(issue)
     unit = db.get(Unit, issue.unit_id)
-    now = datetime.utcnow()
     return _issue_to_out(issue, unit.code if unit else "", now)
 
 
@@ -635,6 +703,22 @@ def compute_stats(db: Session) -> dict:
                 "coverage_pct": round(ratio * 100, 2),
             }
         )
+
+    # 机组专项配置补齐口径：与关卡流转「进入带负荷试运行需补齐全部专项配置」同口径
+    config_complete_units = [u for u in units if _config_coverage_complete(u)]
+    config_complete_count = len(config_complete_units)
+    config_incomplete_count = total - config_complete_count
+    config_incomplete_units = [
+        {
+            "unit_id": u.id,
+            "code": u.code,
+            "name": u.name,
+            "missing_config_types": _missing_config_types(u),
+            "current_stage": (_current_stage(u).value if _current_stage(u) else None),
+        }
+        for u in units
+        if not _config_coverage_complete(u)
+    ]
 
     # --- 按专项配置拆分未关闭问题 ---
     # 构建 unit_id -> enabled config_types 的映射
@@ -755,6 +839,9 @@ def compute_stats(db: Session) -> dict:
         "overdue_unclosed_count": overdue_count,
         "unclosed_issues": open_issue_out,
         "config_coverage": coverage,
+        "config_complete_count": config_complete_count,
+        "config_incomplete_count": config_incomplete_count,
+        "config_incomplete_units": config_incomplete_units,
         "unclosed_by_config": unclosed_by_config,
         "unclosed_by_slope": unclosed_by_slope,
         "unclosed_by_team": unclosed_by_team,
